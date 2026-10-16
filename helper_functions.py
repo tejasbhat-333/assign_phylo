@@ -71,9 +71,93 @@ def neighbor_joining(distances: np.ndarray, labels: list) -> Node:
 
     """
     
-    self.tree = Node()
-
-    raise NotImplementedError()
+    distances = np.array(distances, dtype=float, copy=True)  # never modify input
+    n_leaves = distances.shape[0]
+    if distances.shape != (n_leaves, n_leaves) or len(labels) != n_leaves:
+        raise ValueError("distances must be square and match the labels")
+    if n_leaves < 2:
+        raise ValueError("Need at least two taxa")
+ 
+    # active nodes, new nodes are appended to the end
+    nodes = [Node(str(label), None, 0.0, None, 0.0) for label in labels]
+    taken_names = {node.name for node in nodes}
+    internal_counter = 0
+ 
+    while len(nodes) > 2:
+        n = len(nodes)
+        row_sums = distances.sum(axis=1)
+ 
+        # Q matrix: Q(i, j) = (n - 2) d(i, j) - r_i - r_j
+        q_matrix = (n - 2) * distances - row_sums[:, None] - row_sums[None, :]
+        np.fill_diagonal(q_matrix, np.inf)
+        i, j = np.unravel_index(np.argmin(q_matrix), q_matrix.shape)
+        if i > j:
+            i, j = j, i
+ 
+        d_ij = distances[i, j]
+        dist_i = 0.5 * d_ij + (row_sums[i] - row_sums[j]) / (2.0 * (n - 2))
+        dist_j = d_ij - dist_i
+ 
+        internal_counter += 1
+        new_name = f"node_{internal_counter}"
+        while new_name in taken_names:
+            internal_counter += 1
+            new_name = f"node_{internal_counter}"
+        taken_names.add(new_name)
+        new_node = Node(new_name, nodes[i], float(dist_i), nodes[j], float(dist_j))
+ 
+        # distances from the new node to every other remaining node
+        keep = [k for k in range(n) if k not in (i, j)]
+        d_new = 0.5 * (distances[i, keep] + distances[j, keep] - d_ij)
+ 
+        new_distances = np.zeros((len(keep) + 1, len(keep) + 1))
+        new_distances[: len(keep), : len(keep)] = distances[np.ix_(keep, keep)]
+        new_distances[-1, : len(keep)] = d_new
+        new_distances[: len(keep), -1] = d_new
+ 
+        distances = new_distances
+        nodes = [nodes[k] for k in keep] + [new_node]
+ 
+    # last two nodes are joined by the root, each at half of the distance
+    half = float(distances[0, 1]) / 2.0
+    root_name = "root"
+    while root_name in taken_names:
+        root_name += "_"
+    return Node(root_name, nodes[0], half, nodes[1], half)
+ 
+ 
+def _count_leaves(node: Node) -> int:
+    """Number of leaves below (and including) a node."""
+    if node is None:
+        return 0
+    if node.left is None and node.right is None:
+        return 1
+    return _count_leaves(node.left) + _count_leaves(node.right)
+ 
+ 
+def _is_leaf(node: Node) -> bool:
+    return node.left is None and node.right is None
+ 
+ 
+def _layout_tree(tree: Node):
+    """Compute (x, y) for every node. x = distance from root, y = leaf order
+    for leaves and the midpoint of the children for internal nodes."""
+    positions = {}
+    counter = [0]
+ 
+    def recurse(node, depth):
+        if _is_leaf(node):
+            y = float(counter[0])
+            counter[0] += 1
+        else:
+            y_left = recurse(node.left, depth + node.left_distance)
+            y_right = recurse(node.right, depth + node.right_distance)
+            y = (y_left + y_right) / 2.0
+        positions[id(node)] = (depth, y)
+        return y
+ 
+    recurse(tree, 0.0)
+    return positions
 
 
 def plot_nj_tree(tree: Node, ax: Axes = None, **kwargs) -> None:
@@ -100,6 +184,61 @@ def plot_nj_tree(tree: Node, ax: Axes = None, **kwargs) -> None:
 
     """
 
+    import matplotlib.pyplot as plt
+ 
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(8, 8))
+ 
+    label_colors = kwargs.get("label_colors", {}) or {}
+    label_map = kwargs.get("label_map", {}) or {}
+    show_confidence = kwargs.get("show_confidence", False)
+    line_color = kwargs.get("line_color", "k")
+    line_width = kwargs.get("line_width", 1.5)
+    font_size = kwargs.get("font_size", 12)
+    show_scale = kwargs.get("show_scale", False)
+ 
+    positions = _layout_tree(tree)
+    root_x, root_y = positions[id(tree)]
+ 
+    # small stub to the left of the root
+    max_x = max(p[0] for p in positions.values())
+    stub = kwargs.get("root_stub", 0.02 * max_x if max_x > 0 else 0.2)
+    ax.plot([root_x - stub, root_x], [root_y, root_y], color=line_color, lw=line_width)
+ 
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if _is_leaf(node):
+            continue
+        x, y = positions[id(node)]
+        child_ys = []
+        for child in (node.left, node.right):
+            cx, cy = positions[id(child)]
+            child_ys.append(cy)
+            # horizontal line = genetic distance
+            ax.plot([x, cx], [cy, cy], color=line_color, lw=line_width,
+                    solid_capstyle="butt")
+            if _is_leaf(child):
+                ax.text(cx, cy, f"  {label_map.get(child.name, child.name)}",
+                        color=label_colors.get(child.name, "k"),
+                        fontsize=font_size, verticalalignment="center")
+            else:
+                stack.append(child)
+        # vertical line = divergence from the common ancestor
+        ax.plot([x, x], child_ys, color=line_color, lw=line_width,
+                solid_capstyle="butt")
+        if show_confidence and node.confidence is not None:
+            ax.text(x, y, f"{node.confidence:.2f} ", fontsize=max(font_size - 4, 5),
+                    color="tab:red", ha="right", va="bottom")
+ 
+    if show_scale:
+        ax.set_xlabel("Genetic distance (mismatches)")
+    ax.set_yticks([])
+    for loc in ["top", "right", "left"]:
+        ax.spines[loc].set_visible(False)
+    if not show_scale:
+        ax.spines["bottom"].set_visible(True)
+    ax.margins(x=0.05)
     return ax
 
 
@@ -193,7 +332,19 @@ def sort_children_by_leaves(tree: Node) -> None:
         The root node of the tree.
 
     """
-    raise NotImplementedError()
+    if tree is None or _is_leaf(tree):
+        return
+ 
+    sort_children_by_leaves(tree.left)
+    sort_children_by_leaves(tree.right)
+ 
+    # the child with fewer leaves becomes the left child (ties keep the order)
+    if _count_leaves(tree.left) > _count_leaves(tree.right):
+        tree.left, tree.right = tree.right, tree.left
+        tree.left_distance, tree.right_distance = (
+            tree.right_distance,
+            tree.left_distance,
+        )
 
 
 def plot_nj_tree_radial(tree: Node, ax: Axes = None, **kwargs) -> None:
@@ -219,4 +370,43 @@ def plot_nj_tree_radial(tree: Node, ax: Axes = None, **kwargs) -> None:
     >>> fig.savefig("example_radial.png")
 
     """
-    raise NotImplementedError()
+    import matplotlib.pyplot as plt
+ 
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(8, 8))
+    label_colors = kwargs.get("label_colors", {}) or {}
+ 
+    n_leaves = _count_leaves(tree)
+    positions = _layout_tree(tree)
+ 
+    def to_xy(depth, leaf_y):
+        angle = 2 * np.pi * (leaf_y + 0.5) / n_leaves
+        return depth * np.cos(angle), depth * np.sin(angle), angle
+ 
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if _is_leaf(node):
+            continue
+        depth, y = positions[id(node)]
+        ys = []
+        for child in (node.left, node.right):
+            cdepth, cy = positions[id(child)]
+            ys.append(cy)
+            # arc at the parent's radius up to the child's angle, then radial line
+            x0, y0, _ = to_xy(depth, cy)
+            x1, y1, angle = to_xy(cdepth, cy)
+            ax.plot([x0, x1], [y0, y1], color="k", lw=1.2)
+            if _is_leaf(child):
+                ha = "left" if np.cos(angle) >= 0 else "right"
+                ax.text(x1, y1, f" {child.name} " , ha=ha, va="center", fontsize=8,
+                        color=label_colors.get(child.name, "k"))
+            else:
+                stack.append(child)
+        thetas = np.linspace(2 * np.pi * (ys[0] + 0.5) / n_leaves,
+                             2 * np.pi * (ys[1] + 0.5) / n_leaves, 50)
+        ax.plot(depth * np.cos(thetas), depth * np.sin(thetas), color="k", lw=1.2)
+ 
+    ax.set_aspect("equal")
+    ax.axis("off")
+    return ax
